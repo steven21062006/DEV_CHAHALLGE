@@ -1,5 +1,5 @@
 import express from 'express';
-import pg from 'pg'; // Importamos el paquete pg completo
+import pg from 'pg'; 
 import mongoose from 'mongoose';
 import cors from 'cors';
 
@@ -15,12 +15,11 @@ const pool = new Pool({
     user: 'postgres',
     host: 'localhost',
     database: 'ecotrace_db', 
-    password: '21062006', // OJO: Idealmente usa variables de entorno (.env) para esto
+    password: '21062006', 
     port: 5432,
 });
 
-// --- 2. CONFIGURACIÓN MONGODB (Auditoría - Criterio 1.3) ---
-// Nota: A veces localhost da problemas en Node modernos, si falla usa 127.0.0.1
+// --- 2. CONFIGURACIÓN MONGODB (Auditoría) ---
 try {
     await mongoose.connect('mongodb://127.0.0.1:27017/ecotrace_logs');
     console.log('Mongo Connected');
@@ -28,7 +27,7 @@ try {
     console.error('Mongo Error:', err);
 }
 
-// Esquema flexible para Logs (NoSQL)
+// Esquema flexible para Logs
 const LogSchema = new mongoose.Schema({
     evento: String,
     fecha: { type: Date, default: Date.now },
@@ -40,7 +39,7 @@ const Log = mongoose.model('Log', LogSchema);
 
 // --- RUTAS API ---
 
-// A. LOGIN SIMPLIFICADO
+// A. LOGIN
 app.post('/api/login', async (req, res) => {
     const { email } = req.body;
     try {
@@ -55,7 +54,7 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// B. OBTENER MATERIALES
+// B. MATERIALES
 app.get('/api/materiales', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM materiales');
@@ -65,7 +64,7 @@ app.get('/api/materiales', async (req, res) => {
     }
 });
 
-// C. OBTENER DATOS USUARIO
+// C. USUARIO
 app.get('/api/usuario/:id', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM usuarios WHERE id_usuario = $1', [req.params.id]);
@@ -75,28 +74,34 @@ app.get('/api/usuario/:id', async (req, res) => {
     }
 });
 
-// D. REGISTRAR RECICLAJE
+// D. REGISTRAR RECICLAJE (ACTUALIZADO)
 app.post('/api/reciclar', async (req, res) => {
-    const { id_usuario, id_material, peso } = req.body;
+    // CAMBIO: Ahora recibimos 'detalles_extra' que envía el frontend (marca, barcode, foto)
+    const { id_usuario, id_material, peso, detalles_extra } = req.body;
     const ip = req.ip;
 
     try {
-        // 1. Postgres (Transacción)
+        // 1. Postgres (Transacción de Puntos)
         await pool.query('CALL sp_registrar_reciclaje($1, $2, $3)', 
             [id_usuario, id_material, peso]);
 
-        // 2. MongoDB (Auditoría)
+        // 2. MongoDB (Auditoría COMPLETA)
+        // Guardamos todo: material, peso, marca, código de barras y hash de la foto
         await Log.create({
             evento: 'DEPOSITO_EXITOSO',
             usuario_id: id_usuario,
             ip: ip,
-            detalles: { material: id_material, peso_registrado: peso }
+            detalles: { 
+                material: id_material, 
+                peso_registrado: peso,
+                info_adicional: detalles_extra || {} // Guardamos los datos nuevos aquí
+            }
         });
 
         res.json({ message: 'Procesado correctamente' });
 
     } catch (error) {
-        // Log de Error en Mongo
+        // Log de Error
         try {
             await Log.create({
                 evento: 'ERROR_TRANSACCION',
@@ -104,13 +109,13 @@ app.post('/api/reciclar', async (req, res) => {
                 detalles: { error: error.message }
             });
         } catch (mongoErr) {
-            console.error("Error guardando log de fallo:", mongoErr);
+            console.error("Error log:", mongoErr);
         }
         res.status(500).json({ error: error.message });
     }
 });
 
-// E. REPORTE PARA EL ADMIN
+// E. REPORTE
 app.get('/api/reporte', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM vw_impacto_ambiental');
@@ -121,4 +126,7 @@ app.get('/api/reporte', async (req, res) => {
 });
 
 const PORT = 4000;
-app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
+// CAMBIO IMPORTANTE: Agregamos '0.0.0.0' para que el celular te pueda ver
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Servidor corriendo en puerto ${PORT} y aceptando conexiones externas`);
+});

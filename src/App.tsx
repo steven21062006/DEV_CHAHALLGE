@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import { Scanner } from '@yudiel/react-qr-scanner';
-import { Leaf, User, Recycle, LogOut, QrCode, MapPin, AlertTriangle } from 'lucide-react';
-import './style.css'; 
+// Aquí importamos solo lo que vamos a usar
+import { Leaf, User, Recycle, LogOut, QrCode, MapPin, AlertTriangle, Camera, Barcode } from 'lucide-react';
+import './style.css';
 
 // --- CONFIGURACIÓN DE RED ---
-// Esta es tu IP real de la red Wi-Fi de la PUCE
-const API_URL = 'http://172.22.28.188:4000'; 
+const API_URL = 'http://10.104.117.77:4000'; // Nueva IP de tu Hotspot
 
 // --- INTERFACES ---
 interface Usuario {
@@ -50,20 +50,31 @@ function App() {
   const [emailInput, setEmailInput] = useState<string>('');
   const [materiales, setMateriales] = useState<Material[]>([]);
   
-  // Estados para el proceso de reciclaje
-  const [modoEscaneo, setModoEscaneo] = useState(false);
+  // Estados de control de flujo
+  const [modoEscaneoBasurero, setModoEscaneoBasurero] = useState(false);
+  const [modoEscaneoProducto, setModoEscaneoProducto] = useState(false);
   const [basureroValidado, setBasureroValidado] = useState(false);
   const [distanciaActual, setDistanciaActual] = useState<number | null>(null);
 
-  const [form, setForm] = useState({ materialId: '', peso: '' });
+  // Historial local para evitar fraudes
+  const [codigosUsados, setCodigosUsados] = useState<string[]>([]);
+  const [fotosUsadas, setFotosUsadas] = useState<string[]>([]);
+
+  // Formulario
+  const [form, setForm] = useState({ 
+    materialId: '', 
+    peso: '', 
+    marca: '', 
+    codigoBarras: '', 
+    fotoNombre: '' 
+  });
+  
   const [mensaje, setMensaje] = useState<MensajeEstado>({ texto: '', tipo: '' });
 
-  // Cargar materiales al inicio
   useEffect(() => {
-    // CAMBIO: Usamos la IP en lugar de localhost
     axios.get(`${API_URL}/api/materiales`)
       .then(res => setMateriales(res.data))
-      .catch(err => console.error("Error conectando al backend:", err));
+      .catch(err => console.error("Error backend:", err));
   }, []);
 
   // --- LOGIN ---
@@ -74,121 +85,164 @@ function App() {
       setUser(res.data);
       setMensaje({ texto: '', tipo: '' });
     } catch (err) {
-      setMensaje({ texto: 'Usuario no encontrado o error de conexión', tipo: 'error' });
+      setMensaje({ texto: 'Usuario no encontrado', tipo: 'error' });
     }
   };
 
-  // --- LÓGICA DEL ESCÁNER Y GPS ---
-  const handleScan = (result: any) => {
+  // --- 1. ESCANEO DE BASURERO ---
+  const handleScanBasurero = (result: any) => {
     if (result) {
       try {
         const rawValue = result[0]?.rawValue;
         if (!rawValue) return;
-
         const dataBasurero = JSON.parse(rawValue);
         
         if (!dataBasurero.lat || !dataBasurero.lng) {
-          setMensaje({ texto: 'QR Inválido: No es un basurero EcoTrace.', tipo: 'error' });
-          setModoEscaneo(false);
+          setMensaje({ texto: 'QR inválido.', tipo: 'error' });
+          setModoEscaneoBasurero(false);
           return;
         }
 
         if (!navigator.geolocation) {
-          setMensaje({ texto: 'Tu navegador no soporta GPS.', tipo: 'error' });
+          setMensaje({ texto: 'GPS no soportado.', tipo: 'error' });
           return;
         }
 
         navigator.geolocation.getCurrentPosition(
           (position) => {
-            const userLat = position.coords.latitude;
-            const userLng = position.coords.longitude;
-
             const metros = getDistanceFromLatLonInMeters(
-              userLat, userLng, 
+              position.coords.latitude, position.coords.longitude, 
               dataBasurero.lat, dataBasurero.lng
             );
-
             setDistanciaActual(Math.round(metros));
 
-            // VALIDACIÓN: 10 metros de margen
-            if (metros <= 10) { 
+            if (metros <= 20) { 
               setBasureroValidado(true);
-              setModoEscaneo(false); 
-              setMensaje({ texto: `¡Conectado! Estás a ${Math.round(metros)}m del basurero.`, tipo: 'success' });
+              setModoEscaneoBasurero(false);
+              setMensaje({ texto: `Basurero verificado (${Math.round(metros)}m).`, tipo: 'success' });
             } else {
-              setModoEscaneo(false);
-              setMensaje({ texto: `Estás muy lejos (${Math.round(metros)}m). Acércate al basurero (<5m).`, tipo: 'error' });
+              setModoEscaneoBasurero(false);
+              setMensaje({ texto: `Estás lejos (${Math.round(metros)}m). Acércate.`, tipo: 'error' });
             }
           },
           (error) => {
-            console.error("Error de GPS:", error);
-            setMensaje({ texto: 'Error obteniendo ubicación. Asegúrate de dar permisos.', tipo: 'error' });
-            setModoEscaneo(false);
+            // CORRECCIÓN: Aquí usamos la variable 'error' para que TS no se queje
+            console.error("Error GPS:", error);
+            setMensaje({ texto: 'Error de GPS. Verifica permisos.', tipo: 'error' });
+            setModoEscaneoBasurero(false);
           }
         );
-
       } catch (error) {
-        setMensaje({ texto: 'Error leyendo QR.', tipo: 'error' });
-        setModoEscaneo(false);
+        console.error(error); // Usamos error aquí también
+        setMensaje({ texto: 'Error leyendo QR Basurero.', tipo: 'error' });
+        setModoEscaneoBasurero(false);
       }
     }
   };
 
-  // --- ENVIAR DATOS ---
-  const handleReciclar = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!user || !form.materialId || !form.peso) return;
-
-    try {
-      await axios.post(`${API_URL}/api/reciclar`, {
-        id_usuario: user.id_usuario,
-        id_material: form.materialId,
-        peso: form.peso
-      });
-      
-      const userRes = await axios.get(`${API_URL}/api/usuario/${user.id_usuario}`);
-      setUser(userRes.data);
-      
-      setMensaje({ texto: '¡Puntos sumados exitosamente!', tipo: 'success' });
-      setForm({ materialId: '', peso: '' });
-      setBasureroValidado(false); 
-      setDistanciaActual(null);
-
-    } catch (err: any) {
-      setMensaje({ texto: 'Error en el servidor', tipo: 'error' });
+  // --- 2. ESCANEO DE PRODUCTO ---
+  const handleScanProducto = (result: any) => {
+    if (result) {
+      const codigo = result[0]?.rawValue;
+      if (codigo) {
+        if (codigosUsados.includes(codigo)) {
+          setMensaje({ texto: '¡ALERTA! Este producto ya fue escaneado.', tipo: 'error' });
+          setModoEscaneoProducto(false);
+          return;
+        }
+        setForm({ ...form, codigoBarras: codigo });
+        setModoEscaneoProducto(false);
+        setMensaje({ texto: 'Código capturado.', tipo: 'success' });
+      }
     }
   };
 
-  // --- VISTA LOGIN ---
+  // --- 3. FOTO ---
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      const fileHash = `${file.name}-${file.size}`;
+      
+      if (fotosUsadas.includes(fileHash)) {
+        setMensaje({ texto: 'Imagen duplicada. Toma una nueva.', tipo: 'error' });
+        e.target.value = ''; 
+        return;
+      }
+      setForm({ ...form, fotoNombre: fileHash });
+      setMensaje({ texto: 'Foto cargada correctamente.', tipo: 'success' });
+    }
+  };
+
+  // --- ENVIAR ---
+  const handleReciclar = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!form.materialId || !form.peso || !form.marca) {
+      setMensaje({ texto: 'Falta peso, material o marca.', tipo: 'error' });
+      return;
+    }
+    if (!form.codigoBarras) {
+      setMensaje({ texto: 'Escanea el código de barras.', tipo: 'error' });
+      return;
+    }
+    if (!form.fotoNombre) {
+      setMensaje({ texto: 'Toma la foto de evidencia.', tipo: 'error' });
+      return;
+    }
+
+    try {
+      await axios.post(`${API_URL}/api/reciclar`, {
+        id_usuario: user!.id_usuario,
+        id_material: form.materialId,
+        peso: form.peso,
+        detalles_extra: { 
+          marca: form.marca,
+          barcode: form.codigoBarras,
+          foto_hash: form.fotoNombre
+        }
+      });
+      
+      const userRes = await axios.get(`${API_URL}/api/usuario/${user!.id_usuario}`);
+      setUser(userRes.data);
+      
+      setCodigosUsados([...codigosUsados, form.codigoBarras]);
+      setFotosUsadas([...fotosUsadas, form.fotoNombre]);
+
+      setMensaje({ texto: '¡Reciclaje verificado!', tipo: 'success' });
+      
+      setForm({ materialId: '', peso: '', marca: '', codigoBarras: '', fotoNombre: '' });
+      setBasureroValidado(false);
+      setDistanciaActual(null);
+
+    } catch (err: any) {
+      setMensaje({ texto: 'Error guardando datos.', tipo: 'error' });
+    }
+  };
+
   if (!user) {
     return (
       <div className="container">
         <div className="card login-card">
           <Leaf size={60} color="#059669" style={{marginBottom: 20}} />
           <h1 style={{color: '#1e293b'}}>EcoTrace PUCE</h1>
-          <p>Ingresa tu correo institucional</p>
-          {mensaje.texto && <div className={`msg-box msg-${mensaje.tipo}`}>{mensaje.texto}</div>}
           <form onSubmit={handleLogin}>
-            <input className="input-field" placeholder="ej. estudiante@puce.edu.ec" value={emailInput} onChange={e => setEmailInput(e.target.value)} />
+            <input className="input-field" placeholder="Correo institucional" value={emailInput} onChange={e => setEmailInput(e.target.value)} />
             <button className="btn-primary">Ingresar</button>
           </form>
+          {mensaje.texto && <p style={{color: 'red', marginTop: 10}}>{mensaje.texto}</p>}
         </div>
       </div>
     );
   }
 
-  // --- VISTA DASHBOARD ---
   return (
     <div className="container">
       <div className="header">
         <div>
           <h2>Hola, {user.nombre}</h2>
+          {/* CORRECCIÓN: Usamos el icono User aquí */}
           <span className="user-badge"><User size={14}/> Estudiante</span>
         </div>
-        <div style={{textAlign: 'right'}}>
-          <div className="points-display">{user.puntos_actuales}</div>
-          <small>Puntos</small>
-        </div>
+        <div className="points-display">{user.puntos_actuales} <small>pts</small></div>
       </div>
 
       {mensaje.texto && (
@@ -200,53 +254,79 @@ function App() {
 
       {!basureroValidado ? (
         <div className="card" style={{textAlign: 'center'}}>
-          <h3><QrCode size={24} style={{verticalAlign: 'middle'}}/> Paso 1: Escanear Basurero</h3>
-          <p style={{color: '#64748b'}}>Debes estar cerca del basurero para desbloquear el formulario.</p>
+          {/* CORRECCIÓN: Usamos el icono QrCode aquí */}
+          <h3><QrCode size={24} style={{verticalAlign: 'middle'}}/> 1. Validar Ubicación</h3>
+          <p style={{color: '#64748b'}}>Escanea el QR del basurero para empezar.</p>
           
-          {modoEscaneo ? (
-            <div style={{marginTop: 20}}>
-              <p>Apunta al código QR...</p>
-              <div style={{width: '100%', maxWidth: '300px', margin: '0 auto', border: '2px solid #10b981', borderRadius: 8, overflow: 'hidden'}}>
-                <Scanner onScan={handleScan} />
-              </div>
-              <button onClick={() => setModoEscaneo(false)} className="btn-logout" style={{marginTop: 10, width: '100%', justifyContent: 'center'}}>
-                Cancelar Cámara
-              </button>
+          {modoEscaneoBasurero ? (
+            <div className="scanner-wrapper">
+              <Scanner onScan={handleScanBasurero} />
+              <button onClick={() => setModoEscaneoBasurero(false)} className="btn-logout">Cancelar</button>
             </div>
           ) : (
-            <button onClick={() => setModoEscaneo(true)} className="btn-primary" style={{marginTop: 10}}>
-              Activar Cámara
-            </button>
+            <button onClick={() => setModoEscaneoBasurero(true)} className="btn-primary">Escanear Basurero</button>
           )}
         </div>
       ) : (
         <div className="card">
-          <h3 className="card-title"><Recycle color="#10b981"/> Registrar Depósito</h3>
-          <div style={{fontSize: 12, color: '#059669', marginBottom: 15, display: 'flex', alignItems: 'center', gap: 5}}>
-             <MapPin size={12}/> Ubicación validada ({distanciaActual}m)
-          </div>
+          <h3 className="card-title"><Recycle color="#10b981"/> 2. Registrar Botella</h3>
+          <div style={{fontSize: 12, color: '#059669', marginBottom: 15}}><MapPin size={12}/> Ubicación OK ({distanciaActual}m)</div>
           <hr className="divider" />
           
           <form onSubmit={handleReciclar}>
             <label className="label">Material:</label>
             <select className="input-field" value={form.materialId} onChange={e => setForm({...form, materialId: e.target.value})}>
               <option value="">Seleccione...</option>
-              {materiales.map(m => (
-                <option key={m.id_material} value={m.id_material}>{m.nombre} ({m.puntos_por_kg} pts/kg)</option>
-              ))}
+              {materiales.map(m => <option key={m.id_material} value={m.id_material}>{m.nombre}</option>)}
             </select>
 
-            <label className="label">Peso (Kg):</label>
-            <input type="number" step="0.1" className="input-field" value={form.peso} onChange={e => setForm({...form, peso: e.target.value})} />
+            <div style={{display: 'flex', gap: 10}}>
+              <div style={{flex: 1}}>
+                <label className="label">Peso (Kg):</label>
+                <input type="number" step="0.01" className="input-field" placeholder="0.05" value={form.peso} onChange={e => setForm({...form, peso: e.target.value})} />
+              </div>
+              <div style={{flex: 1}}>
+                <label className="label">Marca:</label>
+                <input type="text" className="input-field" placeholder="Ej. Coca-Cola" value={form.marca} onChange={e => setForm({...form, marca: e.target.value})} />
+              </div>
+            </div>
 
-            <button className="btn-primary" type="submit">Confirmar Reciclaje</button>
+            <label className="label">Código de Barras:</label>
+            {modoEscaneoProducto ? (
+               <div className="scanner-wrapper" style={{marginBottom: 15}}>
+                 <p style={{fontSize: 12}}>Escanea el código de la botella</p>
+                 <Scanner onScan={handleScanProducto} formats={['qr_code', 'ean_13', 'code_128', 'upc_a']} />
+                 <button type="button" onClick={() => setModoEscaneoProducto(false)} className="btn-logout">Cerrar</button>
+               </div>
+            ) : (
+               <div style={{display: 'flex', gap: 10, marginBottom: 15}}>
+                 <input className="input-field" disabled value={form.codigoBarras || "Pendiente de escaneo..."} style={{backgroundColor: '#f1f5f9'}} />
+                 <button type="button" onClick={() => setModoEscaneoProducto(true)} className="btn-primary" style={{width: 'auto'}}><Barcode/></button>
+               </div>
+            )}
+
+            {/* CORRECCIÓN: Agregamos icono de Camera al label */}
+            <label className="label" style={{display: 'flex', alignItems: 'center', gap: 5}}>
+              <Camera size={16}/> Foto de Evidencia:
+            </label>
+            <div style={{marginBottom: 20}}>
+              <input 
+                type="file" 
+                accept="image/*" 
+                capture="environment" 
+                onChange={handleFileChange} 
+                className="input-field" 
+                style={{padding: 10}}
+              />
+              {form.fotoNombre && <small style={{color: 'green'}}>Foto lista: {form.fotoNombre.substring(0, 15)}...</small>}
+            </div>
+
+            <button className="btn-primary" type="submit">Confirmar y Ganar Puntos</button>
           </form>
         </div>
       )}
 
-      <button onClick={() => setUser(null)} className="btn-logout">
-        <LogOut size={16}/> Cerrar Sesión
-      </button>
+      <button onClick={() => setUser(null)} className="btn-logout"><LogOut size={16}/> Salir</button>
     </div>
   );
 }
