@@ -9,13 +9,14 @@
     "preview": "vite preview"
   },
   "devDependencies": {
-    "@types/react": "^19.2.7",
+    "@types/react": "^19.2.8",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.2",
     "typescript": "~5.9.3",
     "vite": "^7.2.4"
   },
   "dependencies": {
+    "@types/node": "^25.0.6",
     "@yudiel/react-qr-scanner": "^2.5.0",
     "axios": "^1.13.2",
     "cors": "^2.8.5",
