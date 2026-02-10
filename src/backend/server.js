@@ -1,12 +1,20 @@
-
-
 import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import mongoose from 'mongoose';
+import multer from 'multer';       
+import PDFDocument from 'pdfkit';  
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
 
 
-const { Pool } = pg;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)){ fs.mkdirSync(uploadsDir); }
 
 const app = express();
 const port = 4000;
@@ -15,7 +23,20 @@ const port = 4000;
 app.use(cors());
 app.use(express.json());
 
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+// --- 2. CONFIGURACIÓN MULTER (FOTOS) ---
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => { cb(null, 'uploads/'); },
+    filename: (req, file, cb) => { 
+        // Evitar nombres duplicados usando timestamp
+        cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname)); 
+    }
+});
+const upload = multer({ storage: storage });
+
+// --- 3. BASE DE DATOS SQL (PostgreSQL) ---
+const { Pool } = pg;
 const pool = new Pool({
     user: 'postgres',
     host: 'localhost',
@@ -24,22 +45,23 @@ const pool = new Pool({
     port: 5432,
 });
 
-
+// --- 4. BASE DE DATOS NOSQL (MongoDB - Auditoría) ---
 mongoose.connect('mongodb://localhost:27017/ecotrace_logs')
-    .then(() => console.log('Mongo Connected (Auditoría Activa)'))
-    .catch(err => console.error('Mongo Error:', err));
+    .then(() => console.log('✅ Mongo Connected (Auditoría)'))
+    .catch(err => console.error('❌ Mongo Error:', err));
 
-
-const LogSchema = new mongoose.Schema({
+const Log = mongoose.model('Log', new mongoose.Schema({ 
     evento: String, 
-    fecha: { type: Date, default: Date.now },
-    usuario_id: Number,
-    ip: String,
+    fecha: { type: Date, default: Date.now }, 
+    usuario_id: Number, 
     detalles: Object 
-});
-const Log = mongoose.model('Log', LogSchema);
+}));
 
 
+
+// --- AUTENTICACIÓN ---
+
+// Login
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
     try {
@@ -49,155 +71,182 @@ app.post('/api/login', async (req, res) => {
         } else {
             res.status(401).json({ error: 'Credenciales incorrectas' });
         }
-    } catch (err) {
+    } catch (err) { 
         console.error(err);
-        res.status(500).json({ error: 'Error interno del servidor' });
+        res.status(500).json({ error: 'Error de servidor' }); 
     }
 });
 
-
+// Registro de Empresas (NUEVO)
 app.post('/api/register', async (req, res) => {
     const { nombre, email, password } = req.body;
     try {
-        
-        const check = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-        if (check.rows.length > 0) {
-            return res.status(400).json({ error: 'El correo ya está registrado.' });
-        }
-        
-        
+        // Verifica si ya existe
+        const check = await pool.query('SELECT 1 FROM usuarios WHERE email = $1', [email]);
+        if (check.rows.length > 0) return res.status(400).json({ error: 'El correo ya existe' });
+
+        // Inserta como rol 
         const result = await pool.query(
-            'INSERT INTO usuarios (nombre, email, password) VALUES ($1, $2, $3) RETURNING *',
+            "INSERT INTO usuarios (nombre, email, password, rol) VALUES ($1, $2, $3, 'estudiante') RETURNING *",
             [nombre, email, password]
         );
-
         
-        await Log.create({
-            evento: 'NUEVO_USUARIO_REGISTRADO',
-            usuario_id: result.rows[0].id_usuario,
-            
-            ip: req.ip || '127.0.0.1',
-            detalles: { email: email }
+        await Log.create({ evento: 'NUEVA_EMPRESA_REGISTRADA', usuario_id: result.rows[0].id_usuario, detalles: { email } });
+        res.json(result.rows[0]);
+    } catch (err) { 
+        console.error(err);
+        res.status(500).json({ error: 'Error al registrar empresa' }); 
+    }
+});
+
+// --- OPERACIONES ---
+
+// Enviar Reciclaje + Foto
+app.post('/api/reciclar', upload.single('evidencia'), async (req, res) => {
+    const { id_usuario, id_material, peso } = req.body;
+    const evidenciaUrl = req.file ? `/uploads/${req.file.filename}` : null;
+
+    try {
+        // Llama al Store Procedure que deja el estado en "Pendiente"
+        await pool.query('CALL sp_registrar_reciclaje($1, $2, $3, $4)', 
+            [id_usuario, id_material, peso, evidenciaUrl]);
+        
+        await Log.create({ 
+            evento: 'SOLICITUD_ENVIADA', 
+            usuario_id: id_usuario, 
+            detalles: { material: id_material, peso, evidencia: evidenciaUrl } 
         });
 
-        res.json(result.rows[0]);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Error al registrar usuario' });
+        res.json({ message: 'Solicitud enviada a auditoría.' });
+    } catch (error) { 
+        console.error("Error SQL:", error);
+        res.status(500).json({ error: 'Error procesando solicitud' }); 
     }
 });
 
-
-app.get('/api/ranking', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT nombre, puntos_actuales FROM usuarios ORDER BY puntos_actuales DESC LIMIT 100');
-        res.json(result.rows);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Error al obtener ranking' });
-    }
-});
-
-
+// Obtener Materiales
 app.get('/api/materiales', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM materiales ORDER BY id_material ASC');
         res.json(result.rows);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Error al obtener materiales' });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-
+// Obtener Usuario 
 app.get('/api/usuario/:id', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM usuarios WHERE id_usuario = $1', [req.params.id]);
-        res.json(result.rows[0]);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Error al obtener usuario' });
-    }
+        if (result.rows.length > 0) res.json(result.rows[0]);
+        else res.status(404).json({ error: 'Usuario no encontrado' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// --- DATOS EN TIEMPO REAL ---
 
+// Ranking (Top 10 Empresas)
+app.get('/api/ranking', async (req, res) => {
+    try {
+        const result = await pool.query("SELECT nombre, puntos_actuales FROM usuarios WHERE rol='estudiante' ORDER BY puntos_actuales DESC LIMIT 10");
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: 'Error cargando ranking' }); }
+});
+
+// Historial Reciente 
 app.get('/api/historial', async (req, res) => {
     try {
-      const result = await pool.query(`
-        SELECT 
-          t.id, 
-          u.nombre as usuario, 
-          m.nombre as material, 
-          t.peso, 
-          t.fecha 
-        FROM transacciones t
-        JOIN usuarios u ON t.id_usuario = u.id_usuario
-        JOIN materiales m ON t.id_material = m.id_material
-        ORDER BY t.fecha DESC 
-        LIMIT 5
-      `);
-      res.json(result.rows);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: 'Error al obtener historial' });
+        const query = `
+            SELECT d.id_deposito, u.nombre as usuario, m.nombre as material, d.peso_kg, d.fecha_registro, d.estado
+            FROM depositos d
+            JOIN usuarios u ON d.id_usuario = u.id_usuario
+            JOIN materiales m ON d.id_material = m.id_material
+            ORDER BY d.fecha_registro DESC LIMIT 5
+        `;
+        const result = await pool.query(query);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: 'Error cargando historial' }); }
+});
+
+// --- PANEL DE ADMINISTRADOR ---
+
+// Ver Pendientes
+app.get('/api/admin/pendientes', async (req, res) => {
+    try {
+        const query = `
+            SELECT d.id_deposito, u.nombre as usuario, m.nombre as material, d.peso_kg, d.evidencia_url, d.fecha_registro 
+            FROM depositos d 
+            JOIN usuarios u ON d.id_usuario = u.id_usuario 
+            JOIN materiales m ON d.id_material = m.id_material 
+            WHERE d.estado = 'Pendiente'
+            ORDER BY d.fecha_registro ASC
+        `;
+        const result = await pool.query(query);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Aprobar Depósito 
+app.post('/api/admin/aprobar', async (req, res) => {
+    const { id_deposito, id_admin } = req.body;
+    try {
+        await pool.query('CALL sp_aprobar_deposito($1, $2)', [id_deposito, id_admin]);
+        
+        await Log.create({ evento: 'ADMIN_APROBADO', usuario_id: id_admin, detalles: { deposito: id_deposito } });
+        res.json({ message: 'Aprobado correctamente' });
+    } catch (err) { 
+        console.error(err);
+        res.status(500).json({ error: err.message }); 
     }
 });
 
-
-app.post('/api/reciclar', async (req, res) => {
-    const { id_usuario, id_material, peso } = req.body;
-    const ip = req.ip || '127.0.0.1';
-
+// Rechazar Depósito
+app.post('/api/admin/rechazar', async (req, res) => {
+    const { id_deposito } = req.body;
     try {
-        
-        await pool.query(
-            'INSERT INTO transacciones (id_usuario, id_material, peso) VALUES ($1, $2, $3)',
-            [id_usuario, id_material, peso]
-        );
+        await pool.query("UPDATE depositos SET estado = 'Rechazado' WHERE id_deposito = $1", [id_deposito]);
+        res.json({ message: 'Rechazado correctamente' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
-        
-        const matRes = await pool.query('SELECT puntos_por_kg FROM materiales WHERE id_material = $1', [id_material]);
-        
-        
-        if (matRes.rows.length === 0) {
-            return res.status(400).json({ error: 'Material no encontrado' });
-        }
+// Generar Reporte PDF
+app.get('/api/admin/reporte-pdf', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT u.nombre, m.nombre as material, d.peso_kg, d.fecha_registro 
+            FROM depositos d 
+            JOIN usuarios u ON d.id_usuario = u.id_usuario 
+            JOIN materiales m ON d.id_material = m.id_material 
+            WHERE d.estado = 'Aprobado' 
+            ORDER BY d.fecha_registro DESC
+        `);
 
-        const puntosGanados = Math.round(matRes.rows[0].puntos_por_kg * peso);
-
-        await pool.query('UPDATE usuarios SET puntos_actuales = puntos_actuales + $1 WHERE id_usuario = $2', [puntosGanados, id_usuario]);
-
+        const doc = new PDFDocument();
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', 'attachment; filename=reporte_auditoria.pdf');
         
-        await Log.create({
-            evento: 'DEPOSITO_MANUAL_EMPRESARIAL',
-            usuario_id: id_usuario,
-            ip: ip,
-            detalles: { 
-                material_id: id_material, 
-                peso_kg: peso,
-                puntos_calculados: puntosGanados
-            }
+        doc.pipe(res);
+
+        // Encabezado PDF
+        doc.fontSize(20).text('Reporte de Auditoría EcoTrace', { align: 'center' });
+        doc.moveDown();
+        doc.fontSize(12).text(`Fecha de Emisión: ${new Date().toLocaleString()}`);
+        doc.moveDown();
+        doc.text('---------------------------------------------------------', { align: 'center' });
+        doc.moveDown();
+
+        // Tabla de datos
+        result.rows.forEach((row, i) => {
+            doc.fontSize(12).text(`${i + 1}. [${new Date(row.fecha_registro).toLocaleDateString()}] ${row.nombre}`);
+            doc.fontSize(10).text(`   Material: ${row.material} | Peso: ${row.peso_kg} Kg`);
+            doc.moveDown(0.5);
         });
 
-        res.json({ message: 'Depósito registrado exitosamente y auditado.', puntos: puntosGanados });
-
-    } catch (error) {
-        console.error(error);
-        
-        
-        try {
-            await Log.create({
-                evento: 'ERROR_DEPOSITO',
-                usuario_id: id_usuario,
-                detalles: { error: error.message }
-            });
-        } catch(e) { console.log("Error guardando log de error en Mongo"); }
-
-        res.status(500).json({ error: 'Error procesando la transacción' });
+        doc.end();
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Error generando PDF');
     }
 });
 
-
 app.listen(port, '0.0.0.0', () => {
-    console.log(`Servidor Empresarial Híbrido corriendo en http://localhost:${port}`);
+    console.log(`🚀 Servidor EcoTrace v2.0 corriendo en http://localhost:${port}`);
 });
